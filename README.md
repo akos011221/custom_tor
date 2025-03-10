@@ -2,8 +2,6 @@
 
 This project implements a custom Tor-like proxy with the goal routing mechanism as follows:
 
-## Routing Mechanism
-
 1. **Client:** Sends `Enc1(Enc2(Enc3(message)))` to `node1`.
 2. **Node1:** Decrypts `Enc1`, forwards `Enc2(Enc3(message))` to `node2`.
 3. **Node2:** Decrypts `Enc2`, forwards `Enc3(message)` to `node3`.
