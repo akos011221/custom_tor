@@ -1,8 +1,9 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use rand::seq::SliceRandom;
+use std::env;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{copy, split};
+use tokio::io::{copy, split, AsyncReadExt, AsyncWriteExt};
 
 /// The `#[derive(Clonse)]` attribute automatically implement the
 /// `Clone` trait, allowing instances of `RelayNode` to be duplicated.
@@ -40,7 +41,7 @@ fn encrypt_layer(data: &[u8], key: &[u8]) -> Vec<u8> {
     // Create a nonce (number used once), it is required for AES-GCM.
     // This time, it is a fixed one, but we should generate a unique
     // one each time.
-    let nonce = Nonce::from_slice(b"unique_nonce_");
+    let nonce = Nonce::from_slice(b"unique_nonce");
 
     // Encrypt the data using the cipher and nonce.
     // `encrypt` returns a Result, and `unwrap()` is used to get the
@@ -49,82 +50,140 @@ fn encrypt_layer(data: &[u8], key: &[u8]) -> Vec<u8> {
     cipher.encrypt(nonce, data).unwrap()
 }
 
-/// `handle_client` is asynchronous, handles an invidual client connection.
-async fn handle_client(inbound: TcpStream, relay_nodes: Vec<RelayNode>) {
-    // Choose a random relay path from the lsit of relay nodes.
+/// `decrypt_layer` decrypts one layer of the onion.
+/// This reverses what is applied in `encrypt_layer`.
+fn decrypt_layer(data: &[u8], key: &[u8]) -> Vec<u8> {
+    let cipher = Aes256Gcm::new_from_slice(key).unwrap();
+    let nonce = Nonce::from_slice(b"unique_nonce");
+    // The `decrypt` method attempts to reverse the encryption.
+    cipher.decrypt(nonce, data).unwrap()
+}
+
+/// `encrypt_onion` applies onion encryption by wrapping the data in
+/// multiple encryption layers. The nodes are processed in reverse
+/// order so that the first node in the path will be the last layer
+/// applied and thus the first to be removed during decryption.
+fn encrypt_onion(data: &[u8], path: &[RelayNode]) -> Vec<u8> {
+    let mut payload = data.to_vec(); // Convert the data slice into an owned vector.
+    // Iterate over the relay nodes in reverse order.
+    for node in path.iter().rev() {
+        payload = encrypt_layer(&payload, &node.pub_key);
+    }
+    payload
+}
+
+/// `decrypt_onion` removes one layer of encryption using the relay's key.
+/// Later, Eech relay would call this on the received data.
+fn decrypt_onion(data: &[u8], key: &[u8]) -> Vec<u8> {
+    decrypt_layer(data, key)
+}
+
+/// `run_client` runs the client mode, which construct an onion-encrypted
+/// payload from a message, connnects to the first relay, sends the payload,
+/// and then waits for a response.
+async fn run_client() {
+    // Define the available relay nodes.
+    let relay_nodes = vec![
+        RelayNode { address: "127.0.0.1:4004".to_string(), pub_key: vec![0; 32] },
+        RelayNode { address: "127.0.0.1:4005".to_string(), pub_key: vec![0; 32] },
+        RelayNode { address: "127.0.0.1:4006".to_string(), pub_key: vec![0; 32] },
+    ];
+
+    // Randomly select a relay path from the available nodes.
     let path = choose_relay_path(&relay_nodes);
-    // Get the final node in the path, that will be the exit node.
-    // `.last()` returns an `Option<&RelayNode>, so with `unwrap`,
-    // we can get the value.
-    let _final_node = path.last().unwrap();
+    println!("Chosen relay path:");
+    for node in &path {
+        println!(" - {}", node.address);
+    }
 
-    // Establish a TCP to the first relay node in the path.
-    // `TcpStream::connect` returns a Future, which we `await`
-    // to get the actual connection.
-    let outbound = TcpStream::connect(&path[0].address).await.unwrap();
+    // Use static message for now, later we'll read from standard input.
+    let message = b"Hello..... testing through this network.";
+    println!("Original message: {}", String::from_utf8_lossy(message));
 
-    // `split` divides bidirectional `TcpStream` into two parts:
-    // (ri/ro) for reading, (wi/wo) for writing.
-    // It's useful when handling input and output concurrently.
-    let (mut ri, mut wi) = split(inbound);
-    let (mut ro, mut wo) = split(outbound);
+    // Apply onion encryption by wrapping the message in multiple encryption layers.
+    let onion_payload = encrypt_onion(message, &path);
+    println!("Onion-encrypted payload  ({} bytes)", onion_payload.len());
+    
+    // Connect to the first relay node in the chosen path.
+    let first_relay = &path[0];
+    println!("Connecting to first relay: {}", first_relay.address);
+    let mut stream = TcpStream::connect(&first_relay.address).await.unwrap();
 
-    // For now, we use a static plaintext message. // TODO: read from `ri`.
-    // We encrypt the plaintext using the public key of the first relay node.
-    let _encrypted_request = encrypt_layer(b"User request data", &path[0].pub_key);
+    // Send the fully onion-encrypted payload.
+    stream.write_all(&onion_payload).await.unwrap();
+    println!("Payload sent. Waiting for response...");
 
-    // Spawn an asynchronous task to handle data flow from the client to the relay.
-    // `tokio::spawn` takes an async block (or a Future) and runs it concurrently.
-    tokio::spawn(async move {
-        // `copy` continously reads from the client's read half (`ri`) and writes
-        // to the relay's write half (`wo`). It handles asynchronous transfer of 
-        // data until the end-of-stream (EOF).
-        let _ = copy(&mut ri, &mut wo).await;
-        // TODO: Implement error handling.
-    });
-        
-    // Spawn another asynchronous task to handle data flow in the reverse
-    // direction: from the relay back to the client.
-    tokio::spawn(async move {
-        // This copies data from the relay's read half (`ro`) to the client's
-        // write half (`wi`).
-        let _ = copy(&mut ro, &mut wi).await;
-        // TODO: Implement error handling.
-    });
+    // Read the response from the relay.
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+
+    // Assume the response is encrypted by the first relay's layer.
+    // We remove decryption by removing that layer.
+    let decrypted_response = decrypt_onion(&response, &first_relay.pub_key);
+    println!("Decrypted response: {}", String::from_utf8_lossy(&decrypted_response));
+}
+
+/// `run_relay` runs the relay mode, which listens on `port`, accepts connections,
+/// decrypts one layer of the onion, and echoes the decrypted payload back.
+/// TODO: relay should forward the payload to the next hop.
+async fn run_relay(port: u16) {
+    let addr = format!("0.0.0.0:{}", port);
+    println!("Relay listening on {}", addr);
+    let listener = TcpListener::bind(&addr).await.unwrap();
+
+    // For now each relay uses a fixed key.
+    let key = vec![0; 32];
+
+    loop {
+        // Accept incoming TCP connection.
+        let (mut stream, client_addr) = listener.accept().await.unwrap();
+        println!("Accepted connection from {}", client_addr);
+
+        // Copy the key, so each task gets its own copy.
+        let key_clone = key.clone();
+
+        // Spawn a new asynchronous task to handle this connection concurrently.
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            // Read all data from the stream.
+            stream.read_to_end(&mut buf).await.unwrap();
+            println!("Received {} bytes", buf.len());
+            
+            // Decrypt one layer of the onion using the relay's key.
+            let decrypted = decrypt_onion(&buf, &key_clone);
+            println!("Decrypted payload: {}", String::from_utf8_lossy(&decrypted));
+
+            // For now, simply echo the decrypted payload back to the client.
+            stream.write_all(&decrypted).await.unwrap();
+            println!("Echoed back the decrypted payload");
+        });
+    }
 }
 
 /// The `#[tokio::main]` macro sets up the Tokio runtime, allowing us to use async/await
 /// in the main function.
 #[tokio::main]
 async fn main() {
-    // `bind` method returns a Future that resolves to a `TcpListener` once the binding
-    // is successful.
-    let listener = TcpListener::bind("0.0.0.0:4004").await.unwrap();
+    // Collect command-line arguments into a vector of strings.
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} [client|relay] [port (if relay)]", args[0]);
+        return;
+    }
 
-    // Some fake relay nodes in the initial code.
-    // `to_string()` converts string literals into owned `String` types.
-    // For now the public keys are vectors of 32 zeroed bytes.
-    // TODO: Implement `pub_key` as actual cryptographic keys.
-    let relay_nodes = vec![
-        RelayNode { address: "10.120.0.1:9000".to_string(), pub_key: vec![0; 32] },
-        RelayNode { address: "10.120.0.2:9001".to_string(), pub_key: vec![0; 32] },
-        RelayNode { address: "10.120.0.3:9002".to_string(), pub_key: vec![0; 32] },
-    ];
-    
-    // This infinite loop continously accepts incoming TCP connections.
-    loop {
-        // `accept` method wait asynchronously for an incoming connection.
-        // It returns a tuple: `TcpStream` and the client's socket address.
-        let (stream, _) = listener.accept().await.unwrap();
-        // Because of ownership rules, we clone the `relay_nodes` vector, so each connection
-        // handler has its own copy. It is required, because ownership in Rust means only one
-        // part of the code can own the data at a time.
-        let nodes_clone = relay_nodes.clone();
+    // Match on the first argument to determine the mode.
+    match args[1].as_str() {
+        "client" => run_client().await,
+        "relay" => {
+            // If a port is provided as the second argument, parse it; otherwise use 4004.
+            let port = if args.len() > 2 {
+                args[2].parse::<u16>().unwrap_or(4004)
+            } else {
+                4004
+            };
+            run_relay(port).await
+        }
 
-        // Spawn an asynchronous task to handle the client connection.
-        // This allows the main loop to continue accepting new connections concurrently.
-        tokio::spawn(async move {
-            handle_client(stream, nodes_clone).await;
-        });
+        _ => eprintln!("Unknown mode: {}. Use 'client' or 'relay'.", args[1]),
     }
 }
