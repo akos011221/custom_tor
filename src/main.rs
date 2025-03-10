@@ -3,7 +3,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use rand::seq::SliceRandom;
 use std::env;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{copy, split, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The `#[derive(Clonse)]` attribute automatically implement the
 /// `Clone` trait, allowing instances of `RelayNode` to be duplicated.
@@ -113,13 +113,25 @@ async fn run_client() {
     stream.write_all(&onion_payload).await.unwrap();
     println!("Payload sent. Waiting for response...");
 
+    // Shutdown the WRITE side to signal EOF, otherwise it'll just hang.
+    stream.shutdown().await.unwrap();
+
     // Read the response from the relay.
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.unwrap();
+    match stream.read_to_end(&mut response).await {
+        Ok(bytes) => println!("Received {} bytes", bytes),
+        Err(e) => {
+            println!("Failed to read response: {}", e);
+            return;
+        }
+    }
 
-    // Assume the response is encrypted by the first relay's layer.
-    // We remove decryption by removing that layer.
-    let decrypted_response = decrypt_onion(&response, &first_relay.pub_key);
+    // Decrypt all layers in reverse order.
+    let mut decrypted_response = response;
+    for node in path.iter().skip(1) {
+        decrypted_response = decrypt_onion(&decrypted_response, &node.pub_key);
+    }
+
     println!("Decrypted response: {}", String::from_utf8_lossy(&decrypted_response));
 }
 
