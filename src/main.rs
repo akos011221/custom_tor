@@ -1,31 +1,85 @@
 use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::{Aes256Gcm, Nonce, Error as AesGcmError};
 use rand::seq::SliceRandom;
 use std::env;
 use std::convert::TryInto;
+use serde::{Deserialize, Deserializer};
+use serde_json;
+use hex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// The `#[derive(Clonse)]` attribute automatically implement the
-/// `Clone` trait, allowing instances of `RelayNode` to be duplicated.
-/// This is required when passing data into asynchronous tasks
-/// without losing ownership.
+/// The #[derive(Deserialize)] attribute tells the Rust compiler to automatically
+/// generate code that can convert JSON data into this struct. Without this, we had 
+/// to write the conversion logic manually.
+///
+/// The #[derive(Clone)] attribute automatically implement the `Clone` trait, allowing
+/// instances of `RelayConfig` to be duplicated.
+#[derive(Deserialize)]
 #[derive(Clone)]
-struct RelayNode {
-    address: String, // String is owned & heap-allocated
-    pub_key: Vec<u8>, // Dynamically sized array of bytes
+struct RelayConfig {
+    address: String,
+    // Use custom function to convert `pub_key` hexadecimal string into Vec<u8>.
+    // This avoids boilerplate codes, better for error handling, as if there's
+    // something wrong, it is catched during the deserialization process.
+    // Also, it makes it clearer that `pub_key` is expected to be a hex string
+    // that we want to convert to bytes.
+    #[serde(deserialize_with = "deserialize_hex_to_bytes")]
+    pub_key: Vec<u8>,
+}
+
+/// The Directory struct represents the overall configuration.
+/// The JSON structure must match the structure of this Rust type.
+#[derive(Deserialize)]
+struct Directory {
+    relays: Vec<RelayConfig>,
+}
+
+/// --- `deserialize_hex_to_bytes` ---
+///
+/// Custom deserialization function for hex string to Vec<u8>.
+/// For more details, refer to the comments inside the `RelayConfig`
+/// struct's `pub_key` field.
+fn deserialize_hex_to_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Deserialize the hex string
+    let hex_string = String::deserialize(deserializer)?;
+
+    // Convert the hex string to Vec<u8>
+    hex::decode(&hex_string).map_err(serde::de::Error::custom)
+}
+
+/// --- `load_relay_list` ---
+///
+/// Reads the configuration file from the provided path, parses
+/// the JSON and returns a Directory struct.
+fn load_relay_list(path: &str) -> Directory {
+    // Read the entire file into a String.
+    // expect() here will panic if reading fails.
+    let config_text = std::fs::read_to_string(path)
+        .expect("Unable to read config file. Ensure the file exists and is in the correct location.");
+
+    // Parse the JSON text into our Directory struct using serde_json.
+    // serde_json::from_str takes a &str and returns a Result<Directory, _>.
+    // expect() will panic if the JSON is malformed.
+    let directory: Directory = serde_json::from_str(&config_text)
+        .expect("JSON format error: Check that the file is correctly formatted.");
+
+    directory
 }
 
 /// --- `choose_relay_path` ---
 ///
-/// Randomly selects a path from the available `RelayNode` objects.
+/// Randomly selects a path from the available `RelayConfig` objects.
 /// Uses the `SliceRandom` trait's `choose_multiple` method, makes it
 /// possible that each client session can have a randomized path.
-fn choose_relay_path(nodes: &[RelayNode]) -> Vec<RelayNode> {
+fn choose_relay_path(nodes: &[RelayConfig]) -> Vec<RelayConfig> {
     let mut rng = rand::thread_rng(); // Creates a random number generator (rng), seeded from the
                                       // OS.
     // `choose_multiple` select 3 random nodes from the slice. We then clone the selected nodes
-    // (creating owned copies) and collect them into a new `Vec<RelayNode>`.
+    // (creating owned copies) and collect them into a new `Vec<RelayConfig>`.
     nodes.choose_multiple(&mut rng, 3).cloned().collect()
 }
 
@@ -60,30 +114,45 @@ fn create_relay_header(next_hop: Option<&str>, payload: Vec<u8>) -> Vec<u8> {
 /// --- `parse_relay_header` ---
 ///
 /// Parses a message that begins with a 4-byte header (length of next hop).
-/// It returns a tuple containing:
-/// - An Option<String>: the next hop address (if present),
-/// - A Vec<8>: the remaining payload.
-/// 
-/// Panics, if the header is malformed.
-fn parse_relay_header(data: &[u8]) -> (Option<String>, Vec<u8>) {
+/// The input is a `&Result<Vec<u8>, AesGcmError>`, which represents the decrypted payload.
+///
+/// Returns a `Result` containing:
+/// - An `Option<String>`: the next hop address (if present),
+/// - A `Vec<u8>`: the remaining payload.
+///
+/// If the input is an `Err`, the error is propagated.
+/// If the header is malformed (e.g., too short or invalid), an `AesGcmError` is returned.
+fn parse_relay_header(data: &Result<Vec<u8>, AesGcmError>) -> Result<(Option<String>, Vec<u8>), AesGcmError> {
     // Ensure there are at least 4 bytes for the length field.
-    if data.len() < 4 {
-        panic!("Invalid message: too short for header");
+    let bytes = match data {
+        Ok(vec) => vec,
+        Err(e) => return Err(e.clone()), // Clone the error to avoid ownership issue.
+    };
+    
+    // Ensure there are at least 4 bytes data.
+    if bytes.len() < 4 {
+        return Err(AesGcmError);
     }
+
     // Read the first 4 bytes and convert them into a u32 (big-endian).
-    let len = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
-    if data.len() < 4 + len {
-        panic!("Invalid message: not enough bytes for next hop");
+    let len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+
+    // Ensure there are enough bytes for the next hop.
+    if bytes.len() < 4 + len {
+        return Err(AesGcmError);
     }
+
     // If length is non-zero, extract the next hop address.
     let next_hop = if len > 0 {
-        Some(String::from_utf8_lossy(&data[4..4 + len]).to_string())
+        Some(String::from_utf8_lossy(&bytes[4..4 + len]).to_string())
     } else {
         None
     };
+
     // The remainder is the payload.
-    let payload = data[4 + len..].to_vec();
-    (next_hop, payload)
+    let payload = bytes[4 + len..].to_vec();
+
+    Ok((next_hop, payload))
 }
 
 /// --- `encrypt_layer` ---
@@ -99,10 +168,10 @@ fn encrypt_layer(data: &[u8], key: &[u8]) -> Vec<u8> {
 /// --- `decrypt_layer` ---
 ///
 /// Decrypts one layer of the onion. It reverses what we apply in `encrypt_layer`.
-fn decrypt_layer(data: &[u8], key: &[u8]) -> Vec<u8> {
+fn decrypt_layer(data: &[u8], key: &[u8]) -> Result<Vec<u8>, AesGcmError>{
     let cipher = Aes256Gcm::new_from_slice(key).unwrap();
     let nonce = Nonce::from_slice(b"unique_nonce");
-    cipher.decrypt(nonce, data).unwrap()
+    cipher.decrypt(nonce, data)
 }
 
 /// --- `encrypt_onion` ---
@@ -111,7 +180,7 @@ fn decrypt_layer(data: &[u8], key: &[u8]) -> Vec<u8> {
 /// Process: For each relay node in the provided `path` (iterated in reverse order),
 /// we prepend a header that indicates the next hop (or None for exit nodes) and
 /// then encrypt the current payload using the node's key.
-fn encrypt_onion(data: &[u8], path: &[RelayNode]) -> Vec<u8> {
+fn encrypt_onion(data: &[u8], path: &[RelayConfig]) -> Vec<u8>{
     // Initial payload is the plaintext.
     let mut payload = data.to_vec();
     // Iterate over the relay nodes in reverse order (from exit to entry).
@@ -137,7 +206,7 @@ fn encrypt_onion(data: &[u8], path: &[RelayNode]) -> Vec<u8> {
 /// Removes one layer of encryption from the onion using the relay's key.
 /// In the reverse path, each relay (or client) will call this to peel off
 /// one layer.
-fn decrypt_onion(data: &[u8], key: &[u8]) -> Vec<u8> {
+fn decrypt_onion(data: &[u8], key: &[u8]) -> Result<Vec<u8>, AesGcmError> {
     decrypt_layer(data, key)
 }
 
@@ -146,15 +215,10 @@ fn decrypt_onion(data: &[u8], key: &[u8]) -> Vec<u8> {
 /// In client mode, we build an onion payload and send it to the first relay.
 /// Then we wait for the response and peel off the onion layers to retrieve
 /// the original message.
-async fn run_client() {
-    let relay_nodes = vec![
-        RelayNode { address: "127.0.0.1:4004".to_string(), pub_key: vec![0; 32] },
-        RelayNode { address: "127.0.0.1:4005".to_string(), pub_key: vec![0; 32] },
-        RelayNode { address: "127.0.0.1:4006".to_string(), pub_key: vec![0; 32] },
-    ];
+async fn run_client(relays: &[RelayConfig]) {
 
     // Randomly choose a relay path from the available nodes.
-    let path = choose_relay_path(&relay_nodes);
+    let path = choose_relay_path(relays);
     println!("Chosen relay path:");
     for node in &path {
         println!(" - {}", node.address);
@@ -166,7 +230,7 @@ async fn run_client() {
 
     // Build onion-encrypted payload.
     let onion_payload = encrypt_onion(message, &path);
-    println!("Onion-encrypted payload ({} bytes): {}", onion_payload.len(), String::from_utf8_lossy(&onion_payload));
+    println!("Onion-encrypted payload ({} bytes): {}", onion_payload.len(), hex::encode(&onion_payload));
 
     // Connect to the first relay in the chosen path.
     let first_relay = &path[0];
@@ -194,7 +258,13 @@ async fn run_client() {
     let mut decrypted_response = response;
     // We iterate from the first relay (entry) to the last.
     for node in &path {
-        decrypted_response = decrypt_onion(&decrypted_response, &node.pub_key);
+        decrypted_response = match decrypt_onion(&decrypted_response, &node.pub_key) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("Failed to decrypt layer: {:?}", e);
+                return;
+            }
+        };
     }
 
     println!("Decrypted response: {}", String::from_utf8_lossy(&decrypted_response));
@@ -208,13 +278,16 @@ async fn run_client() {
 /// 3) Parse the header to determine the next hop and the inner payload.
 /// 4) If there's a next hop, connect to it, forward the payload, and wait for response.
 /// 5) If there's no next hop, it is an exit node. Process the payload (echo it back for now).
-async fn run_relay(port: u16) {
+async fn run_relay(port: u16, relays: &[RelayConfig]) {
     let addr = format!("0.0.0.0:{}", port);
     println!("Relay listening on {}", addr);
     let listener = TcpListener::bind(&addr).await.unwrap();
 
-    // For now, each relay uses a fixed key.
-    let key = vec![0; 32];
+    // Find this relay's key based on its address.
+    let relay = relays.iter()
+        .find(|r| r.address == format!("127.0.0.1:{}", port))
+        .expect("Relay not found in the configuration.");
+    let key = relay.pub_key.clone();
 
     loop {
         // Accept an incoming connection.
@@ -233,34 +306,33 @@ async fn run_relay(port: u16) {
             // Decrypt this relay's layer.
             let decrypted_layer = decrypt_onion(&buf, &key_clone);
             // Parse the header to extract next hop (if there's any) and the inner payload.
-            let (next_hop_opt, inner_payload) = parse_relay_header(&decrypted_layer);
-            println!("Parsed header. Next hop: {:?}", next_hop_opt);
+            if let Ok((next_hop_opt, inner_payload)) = parse_relay_header(&decrypted_layer) {
+                // Determine the response that will be sent upstream.
+                let response_payload = if let Some(next_hop) = next_hop_opt {
+                    // Not the exit node: forward the inner payload to the next hop.
+                    println!("Forwarding payload to the next hop: {}", next_hop);
+                    // Establish connection to the next relay.
+                    let mut next_stream = TcpStream::connect(&next_hop).await.unwrap();
+                    // Send the inner payload.
+                    next_stream.write_all(&inner_payload).await.unwrap();
+                    // Shutdown write to signal EOF.
+                    next_stream.shutdown().await.unwrap();
+                    // Read the response from next hop.
+                    let mut next_response = Vec::new();
+                    next_stream.read_to_end(&mut next_response).await.unwrap();
+                    println!("Received {} bytes from next hop", next_response.len());
+                    next_response
+                } else {
+                    // Exit node: process the payload. For now, we only echo it back.
+                    println!("Exit node reached. Processing payload...");
+                    inner_payload
+                };
 
-            // Determine the response that will be sent upstream.
-            let response_payload = if let Some(next_hop) = next_hop_opt {
-                // Not the exit node: forward the inner payload to the next hop.
-                println!("Forwarding payload to the next hop: {}", next_hop);
-                // Establish connection to the next relay.
-                let mut next_stream = TcpStream::connect(&next_hop).await.unwrap();
-                // Send the inner payload.
-                next_stream.write_all(&inner_payload).await.unwrap();
-                // Shutdown write to signal EOF.
-                next_stream.shutdown().await.unwrap();
-                // Read the response from next hop.
-                let mut next_response = Vec::new();
-                next_stream.read_to_end(&mut next_response).await.unwrap();
-                println!("Received {} bytes from next hop", next_response.len());
-                next_response
-            } else {
-                // Exit node: process the payload. For now, we only echo it back.
-                println!("Exit node reached. Processing payload...");
-                inner_payload
-            };
-
-            // Re-encrypt the response using this relay's key before sending it back upstream.
-            let encrypted_response = encrypt_layer(&response_payload, &key_clone);
-            stream.write_all(&encrypted_response).await.unwrap();
-            println!("Sent encrypted response upstream.");
+                // Re-encrypt the response using this relay's key before sending it back upstream.
+                let encrypted_response = encrypt_layer(&response_payload, &key_clone);
+                stream.write_all(&encrypted_response).await.unwrap();
+                println!("Sent encrypted response upstream.");
+            }
         });
     }
 }
@@ -277,10 +349,21 @@ async fn main() {
         eprintln!("Usage: {} [client|relay] [port (if relay)]", args[0]);
         return;
     }
+    
+    // Load the configuration from the specified file.
+    let config_path = "config/relays.json";
+
+    let directory = load_relay_list(config_path);
+
+    // Print the relay nodes that we loaded from the config file.
+    println!("Loaded relays:");
+    for relay in &directory.relays {
+        println!("Address: {}, Public key: {}", relay.address, hex::encode(&relay.pub_key));
+    }
 
     // Determine mode based on first argument.
     match args[1].as_str() {
-        "client" => run_client().await,
+        "client" => run_client(&directory.relays).await,
         "relay" => {
             // If a port is provided as the second argument, parse it; otherwise, default to 1234.
             let port = if args.len() > 2 {
@@ -288,7 +371,7 @@ async fn main() {
             } else {
                 1234
             };
-            run_relay(port).await
+            run_relay(port, &directory.relays).await
         }
         _ => eprintln!("Unknown mode: {}. Use 'client' or 'relay'.", args[1]),
     }
