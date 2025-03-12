@@ -5,7 +5,6 @@ use std::env;
 use std::convert::TryInto;
 use serde::{Deserialize, Deserializer};
 use serde_json;
-use hex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -126,7 +125,7 @@ fn parse_relay_header(data: &Result<Vec<u8>, AesGcmError>) -> Result<(Option<Str
     // Ensure there are at least 4 bytes for the length field.
     let bytes = match data {
         Ok(vec) => vec,
-        Err(e) => return Err(e.clone()), // Clone the error to avoid ownership issue.
+        Err(e) => return Err(*e), // Clone the error to avoid ownership issue.
     };
     
     // Ensure there are at least 4 bytes data.
