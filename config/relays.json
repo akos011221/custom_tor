@@ -1,0 +1,16 @@
+{
+	"relays": [
+		{
+			"address": "127.0.0.1:4004",
+			"pub_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		},
+		{
+			"address": "127.0.0.1:4005",
+			"pub_key": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+		},
+		{
+			"address": "127.0.0.1:4006",
+			"pub_key": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+		}
+	]
+}
